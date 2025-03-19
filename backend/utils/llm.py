@@ -1,8 +1,12 @@
 import json
 import re
 import os
-from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Tuple, Dict, Any
+from dataclasses import dataclass
+from statistics import mean
+from enum import Enum
+import logging
 
 import tiktoken
 from langchain.schema import (
@@ -26,6 +30,7 @@ from models.trend import TrendEnum, ceo_options, company_options, software_produ
     ai_product_options, TrendType
 from utils.prompts import extract_facts_prompt, extract_learnings_prompt, extract_facts_text_content_prompt
 from utils.llms.fact import get_prompt_facts
+from langsmith import Client
 
 llm_mini = ChatOpenAI(model='gpt-4o-mini')
 llm_mini_stream = ChatOpenAI(model='gpt-4o-mini', streaming=True)
@@ -796,30 +801,337 @@ def answer_persona_question_stream(app: App, messages: List[Message], callbacks:
     return llm_call.invoke(chat_messages, {'callbacks':callbacks}).content
 
 
+# Update the PromptVersion enum with more specific options
+class PromptVersion(str, Enum):
+    DEFAULT = "default"
+    MARKDOWN_RICH = "markdown_rich"
+    MARKDOWN_MINIMAL = "markdown_minimal"
+    CONCISE = "concise"
+    DETAILED = "detailed"
+    ACTIONABLE = "actionable"
+
+@dataclass
+class PromptTemplate:
+    version: PromptVersion
+    template: str
+    description: str  # Added description for tracking purposes
+    avg_rating: float = 0.0
+    use_count: int = 0
+    feedback_scores: List[float] = None
+    last_used: Optional[datetime] = None
+
+    def __post_init__(self):
+        self.feedback_scores = self.feedback_scores or []
+        self.last_used = datetime.now(timezone.utc)
+
+    def update_rating(self, score: float):
+        """Update the rating based on new feedback"""
+        self.feedback_scores.append(score)
+        self.avg_rating = mean(self.feedback_scores) if self.feedback_scores else 0.0
+        self.use_count += 1
+        self.last_used = datetime.now(timezone.utc)
+
+class ResponseMetrics(BaseModel):
+    """Model to track and evaluate response quality metrics"""
+    clarity: int = Field(default=0, ge=0, le=10, description="Clarity of response (0-10)")
+    relevance: int = Field(default=0, ge=0, le=10, description="Relevance to question (0-10)")
+    actionability: int = Field(default=0, ge=0, le=10, description="Actionability of advice (0-10)")
+    formatting: int = Field(default=0, ge=0, le=10, description="Quality of formatting (0-10)")
+    
+    def calculate_overall_score(self) -> float:
+        """Calculate weighted overall score"""
+        weights = {"clarity": 0.3, "relevance": 0.3, "actionability": 0.2, "formatting": 0.2}
+        score = sum(getattr(self, key) * weight for key, weight in weights.items())
+        return score
+
+class PromptManager:
+    def __init__(self):
+        self.prompts: Dict[PromptVersion, PromptTemplate] = {
+            PromptVersion.DEFAULT: PromptTemplate(
+                version=PromptVersion.DEFAULT,
+                description="Balanced assistant with no specific formatting style",
+                template="""You are a personalized AI assistant for {user_name}.
+                {facts_str}
+                
+                Respond to the user's question in a helpful, accurate, and conversational way.
+                
+                {plugin_info}
+                """),
+            PromptVersion.MARKDOWN_RICH: PromptTemplate(
+                version=PromptVersion.MARKDOWN_RICH,
+                description="Heavily formatted with markdown for structured content",
+                template="""You are an AI assistant for {user_name} that prioritizes well-structured responses using markdown.
+                {facts_str}
+                
+                FORMATTING GUIDELINES:
+                1. Use markdown to structure your response with clear hierarchy
+                2. Use **bold** for important points and section headings
+                3. Create bullet lists for multiple items or steps
+                4. Use numbered lists for sequential steps
+                5. Use `code blocks` for technical content or examples
+                6. Create tables with | when comparing options or data
+                7. Use > for quotes or highlighted information
+                
+                {plugin_info}
+                """),
+            PromptVersion.MARKDOWN_MINIMAL: PromptTemplate(
+                version=PromptVersion.MARKDOWN_MINIMAL,
+                description="Light markdown formatting for better readability",
+                template="""You are a personalized AI assistant for {user_name}.
+                {facts_str}
+                
+                Structure your response with light markdown formatting:
+                - Use **bold** only for important points
+                - Use bullet points for lists of items
+                - Use headings for section breaks
+                - Keep formatting minimal but effective
+                
+                {plugin_info}
+                """),
+            PromptVersion.CONCISE: PromptTemplate(
+                version=PromptVersion.CONCISE,
+                description="Very brief and to-the-point responses",
+                template="""You are a direct and concise AI assistant for {user_name}.
+                {facts_str}
+                
+                RESPONSE GUIDELINES:
+                - Limit responses to 3 sentences when possible
+                - Eliminate unnecessary context and preamble
+                - Lead with the most important information first
+                - Use bullet points for multiple items
+                - Prioritize clarity over politeness
+                
+                {plugin_info}
+                """),
+            PromptVersion.DETAILED: PromptTemplate(
+                version=PromptVersion.DETAILED,
+                description="Comprehensive and detailed explanations",
+                template="""You are a thorough and detailed AI assistant for {user_name}.
+                {facts_str}
+                
+                RESPONSE GUIDELINES:
+                - Provide comprehensive explanations with examples
+                - Include context and background information
+                - Use structured sections with clear headings
+                - Support key points with reasoning
+                - Include multiple perspectives when relevant
+                - Use markdown formatting for clarity
+                
+                {plugin_info}
+                """),
+            PromptVersion.ACTIONABLE: PromptTemplate(
+                version=PromptVersion.ACTIONABLE,
+                description="Actionable advice and recommendations",
+                template="""You are an action-oriented AI assistant for {user_name}.
+                {facts_str}
+                
+                RESPONSE GUIDELINES:
+                - Focus on specific, practical advice
+                - Provide clear, actionable steps the user can take
+                - Use numbered lists for sequential actions
+                - Prioritize concreteness over theory
+                - Include timeframes when relevant
+                - Format recommendations with markdown for readability
+                
+                {plugin_info}
+                """)
+        }
+        self.current_version = PromptVersion.DEFAULT
+        self.default_version = PromptVersion.DEFAULT
+        self.langsmith_client = None
+        try:
+            self.langsmith_client = Client()
+        except Exception as e:
+            logging.error(f"Failed to initialize LangSmith client: {e}")
+        
+        self.evaluation_window = timedelta(days=7)
+        self.content_type_mapping = {
+            "technical": PromptVersion.MARKDOWN_RICH,
+            "advice": PromptVersion.ACTIONABLE,
+            "information": PromptVersion.DETAILED,
+            "quick question": PromptVersion.CONCISE,
+        }
+        
+    def get_best_prompt(self, question: str = None) -> PromptTemplate:
+        """Get the best prompt template based on past performance or content type"""
+        # If we have a question, try to select the best template for the content type
+        if question:
+            content_type = self._detect_content_type(question)
+            if content_type in self.content_type_mapping:
+                self.current_version = self.content_type_mapping[content_type]
+                return self.prompts[self.current_version]
+        
+        # Otherwise use ratings-based selection
+        if any(p.feedback_scores for p in self.prompts.values()):
+            best_prompt = max(
+                [p for p in self.prompts.values() if p.feedback_scores], 
+                key=lambda p: p.avg_rating
+            )
+            self.current_version = best_prompt.version
+            return best_prompt
+            
+        # Default if no ratings available
+        self.current_version = self.default_version
+        return self.prompts[self.default_version]
+
+    def _detect_content_type(self, question: str) -> str:
+        """Detect the content type of a question to select an appropriate prompt template"""
+        question = question.lower()
+        
+        # Simple pattern-based detection
+        if any(term in question for term in ["code", "programming", "algorithm", "technical", "software", "hardware"]):
+            return "technical"
+        elif any(term in question for term in ["should i", "recommend", "advice", "suggestion", "help me"]):
+            return "advice"
+        elif any(term in question for term in ["explain", "details", "history", "background", "how does"]):
+            return "information"
+        elif len(question.split()) < 10 or question.endswith("?"):
+            return "quick question"
+            
+        return "default"
+
+    def record_feedback(self, version: PromptVersion, score: float):
+        """Record feedback for a specific prompt version"""
+        if version in self.prompts:
+            self.prompts[version].update_rating(score)
+            self._log_to_langsmith(version, score)
+
+    def record_detailed_feedback(self, version: PromptVersion, metrics: ResponseMetrics):
+        """Record detailed feedback metrics"""
+        overall_score = metrics.calculate_overall_score()
+        self.record_feedback(version, overall_score)
+        
+        try:
+            # Log detailed metrics to LangSmith
+            if self.langsmith_client:
+                self.langsmith_client.create_run(
+                    name="omi_detailed_evaluation",
+                    inputs={
+                        "prompt_version": version,
+                        "metrics": metrics.dict()
+                    },
+                    outputs={"overall_score": overall_score},
+                    tags=["omi_chat", f"version_{version}", "detailed_metrics"]
+                )
+        except Exception as e:
+            logging.error(f"Failed to log detailed metrics to LangSmith: {e}")
+
+    def _log_to_langsmith(self, version: PromptVersion, score: float):
+        """Log feedback to LangSmith if available"""
+        try:
+            if self.langsmith_client:
+                self.langsmith_client.create_run(
+                    name="omi_chat_evaluation",
+                    inputs={"prompt_version": version},
+                    outputs={"score": score},
+                    tags=["omi_chat", f"version_{version}"]
+                )
+        except Exception as e:
+            logging.error(f"Failed to log to LangSmith: {e}")
+
+    def auto_evaluate_response(self, question: str, response: str) -> float:
+        """Use the LLM to evaluate its own response quality"""
+        eval_prompt = f"""
+        Task: Evaluate the quality of an AI assistant's response to a user question.
+        
+        Question: {question}
+        
+        Response: {response}
+        
+        Please rate the response on the following criteria on a scale of 0-10:
+        1. Clarity: How clear and understandable is the response?
+        2. Relevance: How directly does it address the user's question?
+        3. Actionability: Does it provide practical, actionable information?
+        4. Formatting: Is the response well-structured and easy to read?
+        
+        Output a JSON object with ratings for each criterion.
+        """
+        
+        try:
+            result = llm_mini.invoke(eval_prompt)
+            result_text = result.content
+            
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+            if json_match:
+                metrics_dict = json.loads(json_match.group(0))
+                metrics = ResponseMetrics(**metrics_dict)
+                return metrics.calculate_overall_score()
+            
+        except Exception as e:
+            logging.error(f"Error in auto-evaluation: {e}")
+        
+        return 5.0  # Default neutral rating if evaluation fails
+
+# Initialize global prompt manager
+prompt_manager = PromptManager()
+
+def qa_rag_with_feedback(uid: str, question: str, context: str, feedback_score: Optional[float] = None,
+                        plugin: Optional[Plugin] = None, cited: Optional[bool] = False,
+                        messages: List[Message] = [], tz: Optional[str] = "UTC", 
+                        auto_evaluate: bool = True) -> Tuple[str, float]:
+    """Enhanced version of qa_rag that includes feedback handling and auto-evaluation"""
+    # Handle existing feedback if provided
+    if feedback_score is not None:
+        prompt_manager.record_feedback(prompt_manager.current_version, feedback_score)
+    
+    # Get the best prompt for this question
+    prompt = _get_qa_rag_prompt(uid, question, context, plugin, cited, messages, tz)
+    response = llm_medium.invoke(prompt).content
+    
+    # Auto-evaluate response if enabled
+    rating = None
+    if auto_evaluate:
+        try:
+            rating = prompt_manager.auto_evaluate_response(question, response)
+            prompt_manager.record_feedback(prompt_manager.current_version, rating)
+        except Exception as e:
+            logging.error(f"Error in auto-evaluation: {e}")
+    
+    return response, rating
+
 def _get_qa_rag_prompt(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
                        cited: Optional[bool] = False,
                        messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
     user_name, facts_str = get_prompt_facts(uid)
     facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
+    
+    # Get the best prompt based on the question content
+    best_prompt = prompt_manager.get_best_prompt(question)
+    base_prompt = best_prompt.template.format(
+        user_name=user_name,
+        facts_str=facts_str,
+        plugin_info=f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\n" if plugin else ""
+    )
 
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
+    # Determine if this is a case where markdown would be particularly useful
+    needs_markdown = any(term in question.lower() for term in [
+        "compare", "list", "steps", "procedure", "how to", "guide", "tutorial", 
+        "differences", "versus", "vs", "table", "technical", "explain"
+    ])
 
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
+    markdown_instruction = """
+    - Format your response effectively using markdown when appropriate:
+      * Use **bold** for important points and headings
+      * Create bullet lists for multiple items
+      * Use numbered lists for sequential steps
+      * Create tables with | when comparing options
+      * Use code blocks for technical content
+    """ if needs_markdown else ""
+
+    # Citation instructions for memory context
     cited_instruction = """
     - You MUST cite the most relevant <memories> that answer the question. \
       - Only cite in <memories> not <user_facts>, not <previous_messages>.
       - Cite in memories using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]".
       - NO SPACE between the last word and the citation.
       - Avoid citing irrelevant memories.
-    """
+    """ if cited and context and len(context) > 0 else ""
 
+    # Build the complete prompt
     return f"""
     <assistant_role>
-        You are an assistant for question-answering tasks.
+        {base_prompt}
     </assistant_role>
 
     <task>
@@ -828,31 +1140,17 @@ def _get_qa_rag_prompt(uid: str, question: str, context: str, plugin: Optional[P
 
     <instructions>
     - Refine the <question> based on the last <previous_messages> before answering it.
-    - DO NOT use the AI's message from <previous_messages> as references to answer the <question>
-    - Use <question_timezone> and <current_datetime_utc> to refer to the time context of the <question>
-    - It is EXTREMELY IMPORTANT to directly answer the question, keep the answer concise and high-quality.
-    - NEVER say "based on the available memories". Get straight to the point.
-    - If you don't know the answer or the premise is incorrect, explain why. If the <memories> are empty or unhelpful, answer the question as well as you can with existing knowledge.
-    - You MUST follow the <reports_instructions> if the user is asking for reporting or summarizing their dates, weeks, months, or years.
-    {cited_instruction if cited and len(context) > 0 else ""}
-    {"- Regard the <plugin_instructions>" if len(plugin_info) > 0 else ""}.
+    - DO NOT use the AI's message from <previous_messages> as references
+    - Use <question_timezone> and <current_datetime_utc> for time context
+    - Directly answer the question, keep responses high-quality
+    - If you don't know or the premise is incorrect, explain why
+    {markdown_instruction}
+    {cited_instruction}
     </instructions>
-
-    <plugin_instructions>
-    {plugin_info}
-    </plugin_instructions>
-
-    <reports_instructions>
-    - Answer with the template:
-     - Goals and Achievements
-     - Mood Tracker
-     - Gratitude Log
-     - Lessons Learned
-    </reports_instructions>
 
     <question>
     {question}
-    <question>
+    </question>
 
     <memories>
     {context}
@@ -863,405 +1161,63 @@ def _get_qa_rag_prompt(uid: str, question: str, context: str, plugin: Optional[P
     </previous_messages>
 
     <user_facts>
-    [Use the following User Facts if relevant to the <question>]
-        {facts_str.strip()}
+    {facts_str.strip()}
     </user_facts>
 
-    <current_datetime_utc>
-        Current date time in UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-    </current_datetime_utc>
-
     <question_timezone>
-        Question's timezone: {tz}
+    {tz}
     </question_timezone>
+
+    <current_datetime_utc>
+    {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+    </current_datetime_utc>
 
     <answer>
     """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
 
+# Update the existing qa_rag function to use the new system
+def qa_rag(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
+           cited: Optional[bool] = False, messages: List[Message] = [], 
+           tz: Optional[str] = "UTC") -> str:
+    """Main qa_rag function that uses the feedback system internally"""
+    response, _ = qa_rag_with_feedback(uid, question, context, None, plugin, cited, messages, tz)
+    return response
 
-def qa_rag(uid: str, question: str, context: str, plugin: Optional[Plugin] = None, cited: Optional[bool] = False,
-           messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
+def qa_rag_stream(uid: str, question: str, context: str, plugin: Optional[Plugin] = None, 
+                  cited: Optional[bool] = False, messages: List[Message] = [], 
+                  tz: Optional[str] = "UTC", callbacks=[]) -> str:
+    """Streaming version of qa_rag that uses the prompt selection system"""
     prompt = _get_qa_rag_prompt(uid, question, context, plugin, cited, messages, tz)
-    # print('qa_rag prompt', prompt)
-    return llm_medium.invoke(prompt).content
-
-
-def qa_rag_stream(uid: str, question: str, context: str, plugin: Optional[Plugin] = None, cited: Optional[bool] = False,
-                  messages: List[Message] = [], tz: Optional[str] = "UTC", callbacks=[]) -> str:
-    prompt = _get_qa_rag_prompt(uid, question, context, plugin, cited, messages, tz)
-    # print('qa_rag prompt', prompt)
     return llm_medium_stream.invoke(prompt, {'callbacks': callbacks}).content
 
-
-def _get_qa_rag_prompt_v6(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
-                          cited: Optional[bool] = False,
-                          messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
-    cited_instruction = """
-    - You MUST cite the most relevant <memories> that answer the question. \
-      - Only cite in <memories> not <user_facts>, not <previous_messages>.
-      - Cite in memories using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]".
-      - NO SPACE between the last word and the citation.
-      - Avoid citing irrelevant memories.
-    """
-
-    return f"""
-    <assistant_role>
-        You are an assistant for question-answering tasks.
-    </assistant_role>
-
-    <task>
-        Write an accurate, detailed, and comprehensive response to the <question> in the most personalized way possible, using the <memories>, <user_facts> provided.
-    </task>
-
-    <instructions>
-    - Refine the <question> based on the last <previous_messages> before answering it.
-    - DO NOT use the AI's message in <previous_messages> as references to answer the Question.
-    - Keep the answer concise and high-quality.
-    - If you don't know the answer or the premise is incorrect, explain why. If the <memories> are empty or unhelpful, answer the question as well as you can with existing knowledge.
-    - It is EXTREMELY IMPORTANT to directly answer the question.
-    - Use markdown to bold text sparingly, primarily for emphasis within sentences.
-    {cited_instruction if cited and len(context) > 0 else ""}
-    {"- Regard the <plugin_instructions>" if len(plugin_info) > 0 else ""}.
-    </instructions>
-
-    <plugin_instructions>
-    {plugin_info}
-    </plugin_instructions>
-
-    <question>
-    {question}
-    <question>
-
-    <memories>
-    {context}
-    </memories>
-
-    <previous_messages>
-    {Message.get_messages_as_xml(messages)}
-    </previous_messages>
-
-    <user_facts>
-    [Use the following User Facts if relevant to the <question>]
-        {facts_str.strip()}
-    </user_facts>
-
-    <question_timezone>
-        Question's timezone: {tz}
-    </question_timezone>
-
-    <current_datetime_utc>
-        Current date time in UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-    </current_datetime_utc>
-
-    <answer>
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-
-
-def _get_qa_rag_prompt_v5(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
-                          cited: Optional[bool] = False,
-                          messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
-    cited_prompt = """
-    You MUST cite the most relevant converstations(memories) that answer the question. \
-    You MUST ADHERE to the following instructions for citing coverstations(memories).
-     - Cite in memories using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]".
-     - NO SPACE between the last word and the citation.
-     - Cite the most relevant memories that answer the Question. Avoid citing irrelevant memories.
-    """ if cited else ""
-
-    return f"""
-    You are an assistant for question-answering tasks.
-    Write an accurate, detailed, and comprehensive response to the Question in the most personalized way possible, \
-    using the conversations(memory) provided.
-
-    You will be provided previous messages between you and user to help you answer the Question. \
-    It's IMPORTANT to refine the Question base on the last messages only before anwser it.
-
-    Keep the answer concise and high-quality.
-
-    Use markdown to bold text sparingly, primarily for emphasis within sentences.
-
-    {cited_prompt}
-
-    {plugin_info}
-
-    **Question:**
-    ```
-    {question}
-    ```
-
-    **Conversations(Memories):**
-    ---
-    {context}
-    ---
-
-    **Previous messages:**
-    ---
-     {Message.get_messages_as_string(messages)}
-    ---
-
-    Use the following User Facts if relevant to the Question.
-
-    **User Facts:**
-    ---
-    {facts_str.strip()}
-    ---
-
-    Question's timezone: {tz}
-
-    Current date time in UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-
-    Anwser:
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-
-
-def _get_qa_rag_prompt_v4(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
-                          cited: Optional[bool] = False,
-                          messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
-    cited_prompt = """
-    Cite in memories using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]". NO SPACE between the last word and the citation. Cite the most relevant memories that answer the Question. Avoid citing irrelevant memories.
-    """ if cited else ""
-
-    return f"""
-    You are an assistant for question-answering tasks.
-    You answer Question in the most personalized way possible, using the conversations(memory) provided.
-
-    You will be provided previous messages between you and user to help you answer the Question. \
-    It's IMPORTANT to refine the Question base on the last messages only before anwser it.
-
-    {cited_prompt}
-
-    Keep the answer concise.
-
-    Use markdown to bold text sparingly, primarily for emphasis within sentences.
-
-    {plugin_info}
-
-    **Question:**
-    ```
-    {question}
-    ```
-
-    **Conversations(Memories):**
-    ---
-    {context}
-    ---
-
-    **Previous messages:**
-    ---
-     {Message.get_messages_as_string(messages)}
-    ---
-
-    Use the following User Facts if relevant to the Question.
-
-    **User Facts:**
-    ---
-    {facts_str.strip()}
-    ---
-
-    Question's timezone: {tz}
-
-    Current date time in UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-
-    Anwser:
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-
-
-def qa_rag_v4(uid: str, question: str, context: str, plugin: Optional[Plugin] = None, cited: Optional[bool] = False,
-              messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
-    prompt = _get_qa_rag_prompt(uid, question, context, plugin, cited, messages, tz)
-    # print('qa_rag prompt', prompt)
-    return llm_large.invoke(prompt).content
-
-
-def qa_rag_stream_v4(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
-                     cited: Optional[bool] = False,
-                     messages: List[Message] = [], tz: Optional[str] = "UTC", callbacks=[]) -> str:
-    prompt = _get_qa_rag_prompt(uid, question, context, plugin, cited, messages, tz)
-    # print('qa_rag prompt', prompt)
-    return llm_large_stream.invoke(prompt, {'callbacks': callbacks}).content
-
-
-def qa_rag_v3(uid: str, question: str, context: str, plugin: Optional[Plugin] = None, cited: Optional[bool] = False,
-              messages: List[Message] = [], tz: Optional[str] = "UTC") -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
-    cited_prompt = """
-    Cite in memories using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]". NO SPACE between the last word and the citation. Cite the most relevant memories that answer the Question. Avoid citing irrelevant memories.
-    """ if cited else ""
-
-    prompt = f"""
-    You are an assistant for question-answering tasks.
-    You answer Question in the most personalized way possible, using the conversations(memory) provided.
-
-    You will be provided previous messages between you and user to help you answer the Question. \
-    It's IMPORTANT to refine the Question base on the last messages only before anwser it.
-
-    {cited_prompt}
-
-    Use three sentences maximum and keep the answer concise.
-
-    Use markdown to bold text sparingly, primarily for emphasis within sentences.
-
-    {plugin_info}
-
-    **Question:**
-    ```
-    {question}
-    ```
-
-    **Conversations(Memories):**
-    ---
-    {context}
-    ---
-
-    **Previous messages:**
-    ---
-     {Message.get_messages_as_string(messages)}
-    ---
-
-    Use the following User Facts if relevant to the Question.
-
-    **User Facts:**
-    ---
-    {facts_str.strip()}
-    ---
-
-    Question's timezone: {tz}
-
-    Current date time in UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-
-    Anwser:
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-    # print('qa_rag prompt', prompt)
-    return ChatOpenAI(model='gpt-4o').invoke(prompt).content
-
-
-def qa_rag_v2(uid: str, question: str, context: str, plugin: Optional[Plugin] = None,
-              cited: Optional[bool] = False) -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    # Ref: https://www.reddit.com/r/perplexity_ai/comments/1hi981d
-    cited_prompt = """
-    Cite conversations(memories) using [index] at the end of sentences when needed, for example "You discussed optimizing firmware with your teammate yesterday[1][2]". NO SPACE between the last word and the citation.
-    Cite the most relevant conversations(memories) that answer the Question. Avoid citing irrelevant conversations(memories).
-    Cite only in the conversations (memories), not in the User Fact.
-    """ if cited else ""
-
-    prompt = f"""
-    You are an assistant for question-answering tasks.
-    You answer Question in the most personalized way possible, using the conversations(memory) provided.
-
-    {cited_prompt}
-
-    Use three sentences maximum and keep the answer concise.
-
-    {plugin_info}
-
-    **Question:**
-    ```
-    {question}
-    ```
-
-    Use the following User Facts if relevant to the Question:
-
-    **User Facts:**
-    ```
-    {facts_str.strip()}
-    ```
-
-    **Conversations:**
-    ```
-    {context}
-    ```
-
-    Answer:
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-    # print('qa_rag prompt', prompt)
-    return ChatOpenAI(model='gpt-4o').invoke(prompt).content
-
-
-def qa_rag_v1(uid: str, question: str, context: str, plugin: Optional[Plugin] = None) -> str:
-    user_name, facts_str = get_prompt_facts(uid)
-    facts_str = '\n'.join(facts_str.split('\n')[1:]).strip()
-
-    # Use as template (make sure it varies every time): "If I were you $user_name I would do x, y, z."
-    context = context.replace('\n\n', '\n').strip()
-    plugin_info = ""
-    if plugin:
-        plugin_info = f"Your name is: {plugin.name}, and your personality/description is '{plugin.description}'.\nMake sure to reflect your personality in your response.\n"
-
-    prompt = f"""
-    You are an assistant for question-answering tasks.
-    You answer question in the most personalized way possible, using the context provided.
-
-    If the user is asking for advice/recommendations, you must always answer, even if there's no context at all.
-    Never say that you don't have enough information, unless the user is referring or specifically asking about stuff in the past, and nothing related was provided.
-
-    Use three sentences maximum and keep the answer concise.
-
-    {plugin_info}
-
-    Question:
-    {question}
-
-    Context:
-    ```
-    **User Facts:**
-    {facts_str.strip()}
-
-    **Related Conversations:**
-    {context}
-    ```
-    Answer:
-    """.replace('    ', '').replace('\n\n\n', '\n\n').strip()
-    # print('qa_rag prompt', prompt)
-    return ChatOpenAI(model='gpt-4o').invoke(prompt).content
-
+# Add an explicit feedback function to use from the client
+def record_user_feedback(uid: str, question: str, response: str, feedback_score: float, 
+                         detailed_metrics: Dict[str, int] = None) -> None:
+    """Record explicit user feedback about a response"""
+    try:
+        if detailed_metrics:
+            metrics = ResponseMetrics(**detailed_metrics)
+            prompt_manager.record_detailed_feedback(prompt_manager.current_version, metrics)
+        else:
+            prompt_manager.record_feedback(prompt_manager.current_version, feedback_score)
+            
+        # Also log to LangSmith with question-response pair
+        if prompt_manager.langsmith_client:
+            prompt_manager.langsmith_client.create_run(
+                name="user_feedback",
+                inputs={
+                    "user_id": uid,
+                    "question": question,
+                    "prompt_version": prompt_manager.current_version
+                },
+                outputs={
+                    "response": response,
+                    "feedback_score": feedback_score
+                },
+                tags=["user_feedback", f"version_{prompt_manager.current_version}"]
+            )
+    except Exception as e:
+        logging.error(f"Error recording user feedback: {e}")
 
 # **************************************************
 # ************* RETRIEVAL (EMOTIONAL) **************
